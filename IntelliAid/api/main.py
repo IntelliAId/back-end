@@ -1,24 +1,24 @@
+import logging
+import os
+from asyncio import get_event_loop
+import bcrypt
+import jwt
 import openai
+import uvicorn
+import asyncio
 from TTS import tts
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, UploadFile
 from pydantic import BaseModel
-import jwt
-import bcrypt
+from redis import Redis
 from requests import Session
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, declarative_base
-from redis import Redis
 from starlette.websockets import WebSocketDisconnect
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
-import whisper
-from TTS.api import TTS
-import os
-import uvicorn
-from dotenv import load_dotenv
-import openai
-import logging
 from textblob import TextBlob
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from concurrent.futures import ThreadPoolExecutor
+
 load_dotenv()
 openai.api_key=os.getenv("OPENAI_API_KEY")
 
@@ -26,12 +26,10 @@ logging.basicConfig(level=logging.DEBUG)
 
 app = FastAPI()
 
-# url = utils.DATABASE_URL
-# key = utils.SECRET_KEY
 RDS_USERNAME = os.getenv("RDS_USERNAME")
 RDS_PASSWORD = os.getenv("RDS_PASSWORD")
-RDS_HOST = os.getenv("RDS_HOST")  # e.g., "calmnest-db.xxx.region.rds.amazonaws.com"
-RDS_PORT = os.getenv("RDS_PORT", "5432")  # Default PostgreSQL port
+RDS_HOST = os.getenv("RDS_HOST")
+RDS_PORT = os.getenv("RDS_PORT", "5432")
 RDS_DB_NAME = os.getenv("RDS_DB_NAME")
 key = os.getenv("SECRET_KEY")
 
@@ -60,107 +58,138 @@ def get_conversation(user_id: str):
     history = redis.lrange(f"conversation:{user_id}", 0, -1)
     return [msg.decode('utf-8') if isinstance(msg, bytes) else msg for msg in history]
 
-tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
-
-model = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-medium")
-
-def analyze_sentiment(text):
-    blob = TextBlob(text)
-    polarity = blob.sentiment.polarity
-    return {"polarity": polarity}
+# tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
+#
+# model = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-medium")
 
 class TherapyModel:
-    def generate_response(self, user_input: str, history: list = []):
-        # Prepare the conversation history and user input for the model
-        messages = [{"role": "system", "content": "You are a helpful therapist."}]
+    async def generate_response_async(self, user_input: str, history: list = [], websocket=None):
+        system_prompt = "You are a therapist with a calm, reassuring tone. " \
+                        "Respond empathetically, reflecting the user’s emotions without judgment."
 
-        # Add history
+        sentiment = self.analyze_sentiment(' '.join(history) + user_input)
+        if sentiment['polarity'] > 0.5:
+            system_prompt += " The user seems positive, continue to support their optimism."
+        elif sentiment['polarity'] < -0.5:
+            system_prompt += " The user seems upset, offer support and validation for their feelings."
+
+        messages = [{"role": "system", "content": system_prompt}]
         for msg in history:
             messages.append({"role": "user", "content": msg})
-
         messages.append({"role": "user", "content": user_input})
 
-        # Call OpenAI API
         try:
-            response_data = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",  # Chat model
-                messages=messages,
-                max_tokens=150,
-                temperature=0.7
-            )
-            response = response_data.choices[0].message['content'].strip()
-            sentiment = self.analyze_sentiment(response)
-            return response, sentiment
+            loop = get_event_loop()
+            with ThreadPoolExecutor() as pool:
+                response_data = await loop.run_in_executor(
+                    pool,
+                    lambda: openai.ChatCompletion.create(
+                        model="gpt-4o",
+                        messages=messages,
+                        max_tokens=200,
+                        temperature=1,
+                        top_p=1,
+                        frequency_penalty=0,
+                        presence_penalty=0,
+                        stream=False  # Disable streaming
+                    )
+                )
+                full_response = response_data.choices[0].message['content'].strip()
+                final_sentiment = self.analyze_sentiment(full_response)
+                print(f"Sending response: {full_response}, Sentiment: {final_sentiment}")  # Debug log
+                if websocket:
+                    await websocket.send_json({
+                        "response": full_response or "I’m here to help. Can you tell me more?",
+                        "sentiment": final_sentiment,
+                        "is_final": True  # Always final since no streaming
+                    })
+                return full_response, sentiment
 
         except Exception as e:
-            print(f"Error with OpenAI API: {e}")
-            return "I'm having trouble understanding right now. Can you share more?", {"score": 0}
+            print(f"Error with OpenAI API or WebSocket: {e}")
+            error_response = "I'm having trouble understanding right now. Can you share more?"
+            if websocket:
+                await websocket.send_json({
+                    "response": error_response,
+                    "sentiment": {"polarity": 0, "subjectivity": 0},
+                    "is_final": True
+                })
+            return error_response, {"polarity": 0, "subjectivity": 0}
+    # def create_prompt(self, user_input, history):
+    #     # Construct the prompt by concatenating previous conversation context
+    #     history_text = "\n".join(history)
+    #     prompt = f"{history_text}\nUser: {user_input}\nTherapist:"
+    #     return prompt
 
-    def create_prompt(self, user_input, history):
-        # Construct the prompt by concatenating previous conversation context
-        history_text = "\n".join(history)
-        prompt = f"{history_text}\nUser: {user_input}\nTherapist:"
-        return prompt
 
     def analyze_sentiment(self, response):
-        # Implement sentiment analysis logic here
-        return {"score": 0.8 if "good" in response.lower() else -0.5}
+        #create a textBlob object
+        analysis = TextBlob(response)
+        # Analyze polarity (-1 to 1) and subjectivity (0 to 1)
+        polarity = analysis.sentiment.polarity
+        subjectivity = analysis.sentiment.subjectivity
+
+        # Return structured sentiment data
+        return {
+            "polarity": polarity,  # Use for emotional tone assessment
+            "subjectivity": subjectivity  # Use for determining personal opinion level
+        }
 
 class LoginRequest(BaseModel):
     username:str
     password:str
 
-@app.post("/login")
-async def login(request:LoginRequest):
-    hashed_pw = bcrypt.hashpw("password".encode(), bcrypt.gensalt())
-    if request.username != "user" or not bcrypt.checkpw(request.password.encode(), hashed_pw):
-        raise HTTPException(status_code=401, detail="Invalid Credentials")
-    token = jwt.encode({"sub": request.username}, key, alg="HS256")
-    return {"token":token}
+# @app.post("/login")
+# async def login(request:LoginRequest):
+#     hashed_pw = bcrypt.hashpw("password".encode(), bcrypt.gensalt())
+#     if request.username != "user" or not bcrypt.checkpw(request.password.encode(), hashed_pw):
+#         raise HTTPException(status_code=401, detail="Invalid Credentials")
+#     token = jwt.encode({"sub": request.username}, key, alg="HS256")
+#     return {"token":token}
+#
+# @app.post("/users/{username}/mood")
+# async def log_mood(username:str, mood:str):
+#     session = Session()
+#     user = session.query(User).filter_by(username=username).first()
+#     if not user:
+#         #create new user.
+#         user = User(username=username, mood_history="[]", streak_count=0)
+#     user.mood_history = f"{user.mood_history[:-1]}, '{mood}']" if user.mood_history else f"['{mood}']"
+#     user.streak_count += 1
+#     session.add(user)
+#     session.commit()
+#     session.close()
+#     return {"streak": user.streak_count}
 
-@app.post("/users/{username}/mood")
-async def log_mood(username:str, mood:str):
-    session = Session()
-    user = session.query(User).filter_by(username=username).first()
-    if not user:
-        #create new user.
-        user = User(username=username, mood_history="[]", streak_count=0)
-    user.mood_history = f"{user.mood_history[:-1]}, '{mood}']" if user.mood_history else f"['{mood}']"
-    user.streak_count += 1
-    session.add(user)
-    session.commit()
-    session.close()
-    return {"streak": user.streak_count}
+# @app.get("/users/{username}")
+# async def get_user(username: str):
+#     session = Session()
+#     user = session.query(User).filter_by(username=username).first()
+#     session.close()
+#     if not user:
+#         raise HTTPException(status_code=404, detail="User not found")
+#     return {"username": user.username, "mood_history": user.mood_history, "streak": user.streak_count}
+#
+# @app.post("/stt")
+# async def speech_to_text(audio: UploadFile):
+#     if not whisper_model:
+#         return {"text": "Mock speech input"}
+#     audio_data = await audio.read()
+#     with open("temp.wav", "wb") as f:
+#         f.write(audio_data)
+#     try:
+#         result = whisper_model.transcribe("temp.wav")
+#         os.remove("temp.wav")
+#         return {"text": result["text"]}
+#     except Exception as e:
+#         os.remove("temp.wav")
+#         raise HTTPException(status_code=500, detail=f"STT failed: {str(e)}")
 
-@app.get("/users/{username}")
-async def get_user(username: str):
-    session = Session()
-    user = session.query(User).filter_by(username=username).first()
-    session.close()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"username": user.username, "mood_history": user.mood_history, "streak": user.streak_count}
-
-@app.post("/stt")
-async def speech_to_text(audio: UploadFile):
-    if not whisper_model:
-        return {"text": "Mock speech input"}
-    audio_data = await audio.read()
-    with open("temp.wav", "wb") as f:
-        f.write(audio_data)
-    try:
-        result = whisper_model.transcribe("temp.wav")
-        os.remove("temp.wav")
-        return {"text": result["text"]}
-    except Exception as e:
-        os.remove("temp.wav")
-        raise HTTPException(status_code=500, detail=f"STT failed: {str(e)}")
-
-@app.post("/tts")
-async def text_to_speech(text: str):
-    output_file = f"output_{text[:10].replace(' ', '_')}.wav"
-    tts.tts_to_file(text=text, file_path=output_file)
-    return {"audio_file": output_file}
+# @app.post("/tts")
+# async def text_to_speech(text: str):
+#     output_file = f"output_{text[:10].replace(' ', '_')}.wav"
+#     tts.tts_to_file(text=text, file_path=output_file)
+#     return {"audio_file": output_file}
 
 # --- WebSocket Endpoint ---
 therapy_model = TherapyModel()
@@ -174,7 +203,7 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             logging.debug(f"Received data: {data}")
 
-            user_id = data.get("user_id", "user1")
+            user_id = data.get("user_id", "user2")
             user_input = data.get("input") or data.get("mood")
 
             # Verify types
@@ -190,20 +219,20 @@ async def websocket_endpoint(websocket: WebSocket):
             history = get_conversation(user_id)
             logging.debug(f"Conversation history: {history}")
 
-            response, sentiment = therapy_model.generate_response(user_input, history)
+            await therapy_model.generate_response_async(user_input, history,websocket)
             # logging.debug(f"Sentiment polarity: {sentiment['polarity']}")
+            # After streaming, update user streak if applicable
             with Session() as session:
                 user = session.query(User).filter_by(username=user_id).first()
                 if user and "mood" in data:
                     user.streak_count += 1
                     session.add(user)
                     session.commit()
-
-            await websocket.send_json({
-                "response": response,
-                "sentiment": sentiment,
-                "streak": user.streak_count if user else 0
-            })
+                    # Send streak update after final response
+                    await websocket.send_json({
+                        "streak": user.streak_count,
+                        "is_final": True
+                    })
 
     except WebSocketDisconnect:
         print("Client disconnected")
@@ -221,4 +250,4 @@ async def test():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="localhost", port=8001)
+    uvicorn.run(app, host="localhost", port=8003)
